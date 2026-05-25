@@ -275,14 +275,15 @@ def generate_html_with_claude(prompt: str) -> str:
 def job_ravi_digest():
     log.info("=== Job 1: Ravi digest check ===")
     now = datetime.now(IST)
-    target = now + timedelta(days=2)
+    run_now = os.environ.get("RUN_NOW") == "true"
+    target = now if run_now else now + timedelta(days=2)
 
     event = get_ravi_meeting(target)
     if not event:
-        log.info("No Ravi (Trello) meeting in 2 days. Skipping.")
+        log.info("No Ravi (Trello) meeting %s. Skipping.", "today (RUN_NOW)" if run_now else "in 2 days")
         return
 
-    meeting_date = target.strftime("%A, %d %B %Y")
+    meeting_date = target.strftime("%A, %d %B %Y") + (" [TEST]" if run_now else "")
     log.info("Meeting found on %s. Fetching cards...", meeting_date)
 
     cards = fetch_all_open_cards()
