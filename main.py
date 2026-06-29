@@ -414,11 +414,11 @@ def board_name(board: dict) -> str:
 def job_owner_digest(svc, board: dict, run_now: bool):
     bk = board["key"]
     now = datetime.now(IST)
-    target = now if run_now else now + timedelta(days=2)
+    target = now if run_now else now + timedelta(days=0)
     event = find_meeting(svc, board["cal_title"], target)
     if not event:
         log.info("[%s] No meeting %s — owner digest skipped.",
-                 bk, "today (RUN_NOW)" if run_now else "in 2 days")
+                 bk, "today (RUN_NOW)" if run_now else "in 0 days")
         return
     meeting_date = target.strftime("%A, %d %B %Y") + (" [TEST]" if run_now else "")
     log.info("[%s] Owner meeting on %s — building.", bk, meeting_date)
