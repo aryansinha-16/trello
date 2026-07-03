@@ -1,12 +1,17 @@
 """
-Trello Pre-Meeting Digests — Railway Cron Service
+Kaarya Pre-Meeting Digests — Railway Cron Service
 =================================================
 ONE daily cron run (09:00 IST / 03:30 UTC) that, for each configured board,
 checks the shared Google Calendar for that board's meeting and sends:
   - OWNER digest   : when the meeting is 2 days out  (pre-meeting prep)
   - SONAL digest   : when the meeting is today        (key discussion areas)
 
-Boards covered: Ravi, Finance, Sneha.  Add a board by appending to BOARDS.
+Boards covered: HR (=Ravi), Finance, Sneha.  Add a board by appending to BOARDS.
+
+Source: Kaarya MCP (Valuecart's in-house Trello replacement) — read-only,
+Streamable HTTP / JSON-RPC. Cards come from one get_board call per board;
+comments come from get_card (inline). The calendar gate, email MCP, Claude HTML
+generation and prompt templates are unchanged from the Trello version.
 
 Runs once and EXITS (cron-safe). Exits non-zero if any board's job fails, so a
 failed run is visible in Railway, not silently swallowed.
@@ -33,8 +38,10 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # ── Env ──────────────────────────────────────────────────────────────────────
 
-TRELLO_API_KEY    = os.environ["TRELLO_API_KEY"]
-TRELLO_TOKEN      = os.environ["TRELLO_TOKEN"]
+KAARYA_JWT        = os.environ["KAARYA_JWT"]
+KAARYA_MCP_URL    = os.environ.get(
+    "KAARYA_MCP_URL", "https://hubapidev.jennifer-in.com/api/mcp",
+)  # DEV by default; set to https://hubapi.jennifer-in.com/api/mcp once PROD is live
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 # Test mode: when "true" (default), every email goes to TEST_EMAIL instead of the
@@ -45,32 +52,30 @@ SONAL_EMAIL = "sonal@valuecart.in"
 
 # ── Board registry ────────────────────────────────────────────────────────────
 # Each board:
-#   cal_title  : substring matched (case-insensitive) against calendar event titles
-#   board_id   : Trello board id
-#   lists      : {list_id: display_name}  (only these lists are scanned)
-#   skip_lists : list display-names to ignore entirely
-#   labels     : {trello_label_name: priority 1..4}  (1=red/most urgent)
+#   cal_title  : substring matched (case-insensitive) against calendar event titles.
+#                The calendar events are still titled "... (trello)" — those are
+#                Sonal's existing recurring entries, unrelated to the board tool.
+#   board_id   : Kaarya board UUID (lowercase or upper, kept as string)
+#   skip_lists : list display-names to ignore entirely (matched on Kaarya list name)
+#   labels     : {kaarya_label_name: priority 1..4}  (1=red/most urgent) — the
+#                Eisenhower / intervention axis. Combined with the card's native
+#                `priority` field (high/medium/low) — see priority_of().
 #   owner_email: real recipient for the 2-days-out prep digest
 #   person_lane: True if lists are per-person (Finance) → show Owner column
-#   default_pri: priority for cards with no recognised label
+#   default_pri: fallback when neither a known label nor native priority resolves
+# Lists are discovered live from get_board (no hardcoded list IDs needed) — every
+# non-archived list except those in skip_lists is scanned.
 
 BOARDS = [
     {
-        "key": "ravi",
+        "key": "ravi",                       # display name stays "Ravi" (board is HR on Kaarya)
+        "display_name": "Ravi",
         "cal_title": "ravi (trello)",
-        "board_id": "667516b9619b636121467c4e",
+        "board_id": "35107C0B-D729-4A0E-AFF2-E5C265EA3407",  # Kaarya "HR"
         "owner_email": "ravi@valuecart.in",
         "person_lane": False,
         "default_pri": 3,
-        "lists": {
-            "667516b9619b636121467c4f": "Recruiting",
-            "667516b9619b636121467c51": "PMS",
-            "667516b9619b636121467c53": "Activities",
-            "667516b9619b636121467c50": "Open Tasks",
-            "667516b9619b636121467c54": "Open Tasks and Recurring",
-            "667516b9619b636121467c52": "Salary and Compliances",
-        },
-        "skip_lists": [],
+        "skip_lists": ["Future"],
         "labels": {
             "High Preiority and High Intervention": 1,
             "Low Preiority and High Intervention":  2,
@@ -80,48 +85,35 @@ BOARDS = [
     },
     {
         "key": "finance",
+        "display_name": "Finance",
         "cal_title": "finance (trello)",
-        "board_id": "69e6fcb2a6f11e8db5a83764",
+        "board_id": "A42ECC19-D66D-4124-A2B7-E162CC6EC720",  # Kaarya "Finance"
         "owner_email": "roopa@valuecart.in",
         "person_lane": True,
         "default_pri": 3,
-        "lists": {
-            "69df38cc3194e95c95f1f750": "Roopa",
-            "651d247889718f53d49b4435": "Manigandan Ragavan",
-            "69ddeec4b74df23e0e1c1fc7": "Rajya Laxmi",
-            "69ddeed6746f177268144bfb": "Raghu",
-            "69e07b01248e364074f572b8": "Tapas",
-            "69ddeecdc3259e09eab40a7a": "Vinay Kumar",
-        },
-        "skip_lists": ["Tapas"],  # excluded per Sonal
+        "skip_lists": ["Tapas", "Future"],  # Tapas excluded per Sonal; Future skipped
         "labels": {
             "Important & Urgent":        1,
             "Prirority":                 1,
+            "FOCUS":                     1,
             "Urgent but not Important":  2,
             "Important but not Urgent":  2,
-            "Important Only":            3,
             "Sonal (to review)":         2,
+            "Manik to Review":           2,
+            "Important Only":            3,
             "BaU process":               4,
             "Done":                      4,
         },
     },
     {
         "key": "sneha",
+        "display_name": "Sneha",
         "cal_title": "sneha (trello)",
-        "board_id": "64d5f4b811a1bc3f629882cb",
+        "board_id": "5C29193F-228D-4BE1-B0AA-CCC7432A98FE",  # Kaarya "Sneha"
         "owner_email": "sneha@valuecart.in",
         "person_lane": False,
         "default_pri": 3,
-        "lists": {
-            "69ca0228540d9bb637911eb7": "Recurring Tasks",
-            "64d5f4b811a1bc3f629882d2": "Personal",
-            "64d5f4b811a1bc3f629882d3": "Girnar",
-            "6650828949c969cdde04e5e5": "Admin",
-            "65bb51c5290710953c889794": "Embassy",
-            "65e94d54c4c06a1bfd8d854c": "Aarya",
-            "65657d7e29f8b034b6f6f9c1": "Future",
-        },
-        "skip_lists": ["Future"],  # skipped per memory
+        "skip_lists": ["Future"],
         "labels": {
             "High Priority, High Intervention": 1,
             "Low Priority, High Intervention":  2,
@@ -198,64 +190,106 @@ def send_email(to: str, subject: str, html_body: str):
     log.info("Email sent to %s: %s", to, subject)
 
 
-# ── Trello ────────────────────────────────────────────────────────────────────
+# ── Kaarya MCP ────────────────────────────────────────────────────────────────
 
-def trello_get(path: str, **params) -> dict | list:
-    url = f"https://api.trello.com/1/{path}"
-    params.update({"key": TRELLO_API_KEY, "token": TRELLO_TOKEN})
-    r = requests.get(url, params=params, timeout=20)
+def kaarya_call(tool: str, **arguments) -> dict | list:
+    """Call a Kaarya MCP tool (JSON-RPC over Streamable HTTP) and return the
+    parsed result. The payload is an SSE 'data:' line whose result.content[0].text
+    is itself a JSON string — so we parse twice."""
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    }
+    r = requests.post(
+        KAARYA_MCP_URL, json=payload,
+        headers={
+            "Authorization": f"Bearer {KAARYA_JWT}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+        timeout=30,
+    )
     r.raise_for_status()
-    return r.json()
+    data_line = next((l for l in r.text.splitlines() if l.startswith("data:")), None)
+    raw = data_line[5:].strip() if data_line else r.text.strip()
+    env = json.loads(raw)
+    if "error" in env:
+        raise Exception(f"Kaarya MCP error ({tool}): {env['error'].get('message')}")
+    return json.loads(env["result"]["content"][0]["text"])
+
+
+# Cache the get_board response per run so the owner+sonal jobs for one board don't
+# each re-pull a 100KB+ payload (board responses include every card).
+_board_cache: dict[str, dict] = {}
+
+
+def get_board(board: dict) -> dict:
+    bid = board["board_id"]
+    if bid not in _board_cache:
+        _board_cache[bid] = kaarya_call("get_board", boardId=bid)
+    return _board_cache[bid]
 
 
 def fetch_all_open_cards(board: dict) -> list[dict]:
-    """Open cards across the board's lists (minus skip_lists), enriched with list name."""
-    cards = []
+    """Open (not Completed) cards across the board's lists minus skip_lists,
+    enriched with `_list_name`. Cards come at the top level of get_board and are
+    joined to lists by list_id."""
+    data = get_board(board)
     skip = set(board.get("skip_lists", []))
-    for list_id, list_name in board["lists"].items():
+    list_name_by_id = {L["id"]: L.get("name", "") for L in data.get("lists", [])}
+    cards = []
+    for c in data.get("cards", []):
+        if c.get("archived") or c.get("is_archived"):
+            continue
+        if (c.get("status_name") or "").strip().lower() == "completed":
+            continue
+        list_name = list_name_by_id.get(c.get("list_id"), "")
         if list_name in skip:
             continue
-        try:
-            raw = trello_get(
-                f"lists/{list_id}/cards",
-                fields="name,due,dueComplete,badges,labels,idList",
-                filter="open",
-            )
-            for c in raw:
-                c["_list_name"] = list_name
-            cards.extend(raw)
-        except Exception as e:
-            log.warning("[%s] Failed list %s (%s): %s", board["key"], list_name, list_id, e)
+        c["_list_name"] = list_name
+        cards.append(c)
     return cards
 
 
 def fetch_card_comments(card_id: str, limit: int = 8) -> list[str]:
-    """Most-recent commentCard texts for one card (newest first)."""
+    """Most-recent comment texts for one card (newest first), via get_card."""
     try:
-        actions = trello_get(
-            f"cards/{card_id}/actions", filter="commentCard", limit=limit,
-        )
+        card = kaarya_call("get_card", cardId=card_id)
     except Exception as e:
         log.warning("Failed comments for card %s: %s", card_id, e)
         return []
+    comments = card.get("comments") or []
+    # Kaarya returns comments oldest-first; reverse to newest-first like the old code.
     out = []
-    for a in actions:
-        txt = a.get("data", {}).get("text", "").strip()
+    for cm in reversed(comments):
+        txt = (cm.get("text") or cm.get("body") or cm.get("content") or "").strip()
         if txt:
             out.append(txt)
-    return out
+    return out[:limit]
+
+
+# Native Kaarya priority (urgency axis). Lower number = more urgent.
+_NATIVE_PRI = {"high": 1, "medium": 3, "low": 4}
 
 
 def priority_of(board: dict, card: dict) -> int:
+    """Combine the two axes (Aryan's decision 2026-06-29):
+      - intervention/involvement → Eisenhower LABELS (board["labels"])
+      - urgency                  → native `priority` field (high/medium/low)
+    Take the most-urgent (lowest) of whatever resolves; fall back to default_pri."""
+    candidates = []
     for lbl in card.get("labels", []):
         p = board["labels"].get(lbl.get("name", ""))
         if p:
-            return p
-    return board["default_pri"]
+            candidates.append(p)
+    native = _NATIVE_PRI.get((card.get("priority") or "").lower())
+    if native:
+        candidates.append(native)
+    return min(candidates) if candidates else board["default_pri"]
 
 
 def due_status(due_str: str | None) -> str:
-    if not due_str:
+    if not due_str or due_str == "None":
         return "no-due"
     now = datetime.now(IST)
     due = datetime.fromisoformat(due_str.replace("Z", "+00:00")).astimezone(IST)
@@ -270,14 +304,14 @@ def due_status(due_str: str | None) -> str:
 
 
 def checklist_summary(card: dict) -> dict:
-    total   = card["badges"].get("checkItems", 0)
-    checked = card["badges"].get("checkItemsChecked", 0)
+    total   = card.get("task_count", 0) or 0
+    checked = card.get("task_done_count", 0) or 0
     return {"total": total, "checked": checked, "pending": total - checked}
 
 
 def sort_key(board: dict, card: dict):
     order = {"overdue": 0, "today": 1, "due-soon": 2, "normal": 3, "no-due": 4}
-    return (priority_of(board, card), order[due_status(card.get("due"))])
+    return (priority_of(board, card), order[due_status(card.get("due_date"))])
 
 
 # ── Card serialization for the LLM ────────────────────────────────────────────
@@ -293,10 +327,10 @@ def build_card_data_text(board: dict, cards: list[dict], with_comments: bool) ->
     lines = []
     for c in sorted(cards, key=lambda x: sort_key(board, x)):
         cl  = checklist_summary(c)
-        due = c.get("due", "None")
+        due = c.get("due_date") or "None"
         pri = priority_of(board, c)
         block = (
-            f"CARD: {c['name']}\n"
+            f"CARD: {c['title']}\n"
             f"  List: {c['_list_name']}\n"
             f"  Section: {pri} ({SECTION_MAP[pri]})\n"
             f"  Due: {due} | Status: {due_status(due)}\n"
@@ -408,7 +442,7 @@ def owner_first(board: dict) -> str:
 
 
 def board_name(board: dict) -> str:
-    return board["key"].capitalize()
+    return board.get("display_name") or board["key"].capitalize()
 
 
 def job_owner_digest(svc, board: dict, run_now: bool):
@@ -417,6 +451,7 @@ def job_owner_digest(svc, board: dict, run_now: bool):
     target = now if run_now else now + timedelta(days=0)
     event = find_meeting(svc, board["cal_title"], target)
     if not event:
+
         log.info("[%s] No meeting %s — owner digest skipped.",
                  bk, "today (RUN_NOW)" if run_now else "in 0 days")
         return
@@ -426,7 +461,7 @@ def job_owner_digest(svc, board: dict, run_now: bool):
     owner_to, _ = recipients_for(board)
     cards = fetch_all_open_cards(board)
     if not cards:
-        send_email(owner_to, f"{board_name(board)} (Trello) — Pre-Meeting Prep | {meeting_date}",
+        send_email(owner_to, f"{board_name(board)} (Kaarya) — Pre-Meeting Prep | {meeting_date}",
                    "<p>All clear — no open cards on the board.</p>")
         return
     card_data = build_card_data_text(board, cards, with_comments=False)
@@ -437,7 +472,7 @@ def job_owner_digest(svc, board: dict, run_now: bool):
         card_data=card_data,
     )
     html = generate_html_with_claude(prompt)
-    send_email(owner_to, f"{board_name(board)} (Trello) — Pre-Meeting Prep | {meeting_date}", html)
+    send_email(owner_to, f"{board_name(board)} (Kaarya) — Pre-Meeting Prep | {meeting_date}", html)
     log.info("[%s] Owner digest sent to %s.", bk, owner_to)
 
 
