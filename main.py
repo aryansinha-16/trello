@@ -40,8 +40,9 @@ IST = ZoneInfo("Asia/Kolkata")
 
 KAARYA_JWT        = os.environ["KAARYA_JWT"]
 KAARYA_MCP_URL    = os.environ.get(
-    "KAARYA_MCP_URL", "https://hubapidev.jennifer-in.com/api/mcp",
-)  # DEV by default; set to https://hubapi.jennifer-in.com/api/mcp once PROD is live
+    "KAARYA_MCP_URL", "https://kaaryaapi.jennifer-in.com/api/mcp",
+)  # Kaarya moved off hubapidev (now 502) to its own host, 2026-07-10.
+   # NOTE the API host is kaaryaAPI.*; kaarya.jennifer-in.com is the UI (405 on POST).
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 # Test mode: when "true" (default), every email goes to TEST_EMAIL instead of the
@@ -120,6 +121,34 @@ BOARDS = [
             "High Priority, Low Intervention":  3,
             "Low Priority, Low Intervention":   4,
         },
+    },
+    {
+        # Technology is structurally UNLIKE the other three (surveyed 2026-07-10):
+        #  - person-lane board (lists are people), like Finance
+        #  - NO Eisenhower labels. Its 54 labels are workflow/status/people tags
+        #    ("In Progress", "Done", "Bug/Error", "Irfan", ...). Bare High/Medium/Low
+        #    labels exist but sit on ZERO cards -> `labels` is intentionally empty and
+        #    triage runs off the native `priority` field alone (Aryan's call).
+        #  - `status_name` is null on most cards, so the "exclude Completed" filter
+        #    barely bites; the real completion signal here is the `Done` LABEL.
+        #  - "Future" is a 65-card backlog dump -> skipped, leaving ~31 live cards.
+        #  - Sonal's lane holds zombie cards due 2018/2020 (2000+ days overdue) which
+        #    would otherwise monopolise the Must-Discuss box -> stale_after_days.
+        "key": "technology",
+        "display_name": "Technology",
+        "cal_title": "technology (trello)",
+        "board_id": "84436E51-C613-4C46-98F8-AFEE7F28864A",  # Kaarya "Technology"
+        "owner_email": "shrinivas@jennifer-in.com",
+        "person_lane": True,
+        "default_pri": 3,
+        "skip_lists": ["Future"],
+        "labels": {},                # no Eisenhower matrix on this board
+        "done_labels": ["Done"],     # label-based completion, not status_name
+        "stale_after_days": 180,     # drop cards overdue by more than this
+        # With no labels almost everything lands at P3, so the usual pri<=2 comment
+        # gate would skip the richest cards (HSN tool = 55 comments). Pull comments
+        # for any card that has them.
+        "comment_pull_min_count": 1,
     },
 ]
 
@@ -230,24 +259,54 @@ def get_board(board: dict) -> dict:
     return _board_cache[bid]
 
 
+def _days_overdue(due_str: str | None) -> int:
+    """Positive = days past due. 0 when there is no due date."""
+    if not due_str or due_str == "None":
+        return 0
+    try:
+        due = datetime.fromisoformat(due_str.replace("Z", "+00:00")).astimezone(IST)
+    except ValueError:
+        return 0
+    return (datetime.now(IST).date() - due.date()).days
+
+
 def fetch_all_open_cards(board: dict) -> list[dict]:
     """Open (not Completed) cards across the board's lists minus skip_lists,
     enriched with `_list_name`. Cards come at the top level of get_board and are
-    joined to lists by list_id."""
+    joined to lists by list_id.
+
+    Two opt-in filters (used by Technology, no-ops elsewhere):
+      done_labels      — treat these label names as "completed" (that board leaves
+                         status_name null and marks completion with a `Done` label)
+      stale_after_days — drop cards overdue by more than N days (zombie cards from
+                         2018/2020 that would otherwise lead the Must-Discuss box)
+    """
     data = get_board(board)
     skip = set(board.get("skip_lists", []))
+    done_labels = {l.lower() for l in board.get("done_labels", [])}
+    stale_after = board.get("stale_after_days")
     list_name_by_id = {L["id"]: L.get("name", "") for L in data.get("lists", [])}
-    cards = []
+    cards, dropped_stale = [], 0
     for c in data.get("cards", []):
         if c.get("archived") or c.get("is_archived"):
             continue
         if (c.get("status_name") or "").strip().lower() == "completed":
             continue
+        if done_labels and any(
+            (l.get("name") or "").lower() in done_labels for l in c.get("labels", [])
+        ):
+            continue
         list_name = list_name_by_id.get(c.get("list_id"), "")
         if list_name in skip:
             continue
+        if stale_after and _days_overdue(c.get("due_date")) > stale_after:
+            dropped_stale += 1
+            continue
         c["_list_name"] = list_name
         cards.append(c)
+    if dropped_stale:
+        log.info("[%s] Dropped %d stale card(s) overdue >%dd.",
+                 board["key"], dropped_stale, stale_after)
     return cards
 
 
@@ -260,8 +319,12 @@ def fetch_card_comments(card_id: str, limit: int = 8) -> list[str]:
         return []
     comments = card.get("comments") or []
     # Kaarya returns comments oldest-first; reverse to newest-first like the old code.
+    # Skip soft-deleted comments: Kaarya keeps them in the payload (and counts them in
+    # card.comment_count) with is_deleted=true — usually blanked, but don't rely on that.
     out = []
     for cm in reversed(comments):
+        if cm.get("is_deleted"):
+            continue
         txt = (cm.get("text") or cm.get("body") or cm.get("content") or "").strip()
         if txt:
             out.append(txt)
@@ -276,7 +339,11 @@ def priority_of(board: dict, card: dict) -> int:
     """Combine the two axes (Aryan's decision 2026-06-29):
       - intervention/involvement → Eisenhower LABELS (board["labels"])
       - urgency                  → native `priority` field (high/medium/low)
-    Take the most-urgent (lowest) of whatever resolves; fall back to default_pri."""
+    Take the most-urgent (lowest) of whatever resolves; fall back to default_pri.
+
+    Technology sets labels={} on purpose (it has no Eisenhower matrix), so this
+    degrades to native-priority-only + default_pri there. Don't "fix" the empty dict.
+    """
     candidates = []
     for lbl in card.get("labels", []):
         p = board["labels"].get(lbl.get("name", ""))
@@ -324,6 +391,22 @@ def build_card_data_text(board: dict, cards: list[dict], with_comments: bool) ->
     for priority 1-2 cards (where the real status/figures live) — per the hard-won
     lesson that field-only prompts produce hollow, generic 'what's the status?' rows.
     """
+    # Which cards are worth spending a get_card call on for comments?
+    # Default (HR/Finance/Sneha): the Eisenhower labels reliably push the cards that
+    # matter into P1/P2, so priority alone is a good proxy.
+    # Technology has NO Eisenhower labels, so its most-discussed cards sit at P3 —
+    # e.g. "HSN tool building" (55 comments) and "List for next 2 weeks" (36). Gating
+    # on priority there would starve the LLM and produce the hollow generic prompts
+    # this pipeline exists to avoid. So also pull any card with real discussion on it.
+    min_comments = board.get("comment_pull_min_count")
+
+    def wants_comments(card: dict, pri: int) -> bool:
+        if pri <= 2:
+            return True
+        if min_comments and (card.get("comment_count") or 0) >= min_comments:
+            return True
+        return False
+
     lines = []
     for c in sorted(cards, key=lambda x: sort_key(board, x)):
         cl  = checklist_summary(c)
@@ -336,7 +419,7 @@ def build_card_data_text(board: dict, cards: list[dict], with_comments: bool) ->
             f"  Due: {due} | Status: {due_status(due)}\n"
             f"  Checklist: {cl['checked']}/{cl['total']} (pending: {cl['pending']})\n"
         )
-        if with_comments and pri <= 2:
+        if with_comments and wants_comments(c, pri):
             comments = fetch_card_comments(c["id"])
             if comments:
                 joined = "\n    - ".join(comments[:5])
