@@ -73,7 +73,7 @@ BOARDS = [
         "display_name": "Ravi",
         "cal_title": "ravi (trello)",
         "board_id": "35107C0B-D729-4A0E-AFF2-E5C265EA3407",  # Kaarya "HR"
-        "owner_email": "ravi@valuecart.in",
+        "owner_email": "ravishankar@valuecart.in",
         "person_lane": False,
         "default_pri": 3,
         "skip_lists": ["Future"],
